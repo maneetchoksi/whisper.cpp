@@ -381,6 +381,7 @@ static const whisper_ahead g_aheads_medium[]    = { {13, 15}, {15, 4}, {15, 15},
 static const whisper_ahead g_aheads_large_v1[]  = { {9, 19}, {11, 2}, {11, 4}, {11, 17}, {22, 7}, {22, 11}, {22, 17}, {23, 2}, {23, 15} };
 static const whisper_ahead g_aheads_large_v2[]  = { {10, 12}, {13, 17}, {16, 11}, {16, 12}, {16, 13}, {17, 15}, {17, 16}, {18, 4}, {18, 11}, {18, 19}, {19, 11}, {21, 2}, {21, 3}, {22, 3}, {22, 9}, {22, 12}, {23, 5}, {23, 7}, {23, 13}, {25, 5}, {26, 1}, {26, 12}, {27, 15} };
 static const whisper_ahead g_aheads_large_v3[]  = { {7, 0}, {10, 17}, {12, 18}, {13, 12}, {16, 1}, {17, 14}, {19, 11}, {21, 4}, {24, 1}, {25, 6} };
+static const whisper_ahead g_aheads_large_v3_turbo[]  = { {2, 4}, {2, 11}, {3, 3}, {3, 6}, {3, 11}, {3, 14} };
 
 static const std::map<whisper_alignment_heads_preset, whisper_aheads> g_aheads {
     { WHISPER_AHEADS_TINY_EN,   {  8, g_aheads_tiny_en   } },
@@ -394,6 +395,7 @@ static const std::map<whisper_alignment_heads_preset, whisper_aheads> g_aheads {
     { WHISPER_AHEADS_LARGE_V1,  {  9, g_aheads_large_v1  } },
     { WHISPER_AHEADS_LARGE_V2,  { 23, g_aheads_large_v2  } },
     { WHISPER_AHEADS_LARGE_V3,  { 10, g_aheads_large_v3  } },
+    { WHISPER_AHEADS_LARGE_V3_TURBO, { 6, g_aheads_large_v3_turbo } },
 };
 
 static std::vector<uint32_t> get_alignment_heads_by_layer(const whisper_context_params & cparams, int il, int32_t n_text_layer, int32_t n_head);
@@ -697,9 +699,9 @@ struct whisper_kv_cache {
     struct ggml_tensor * k;
     struct ggml_tensor * v;
 
-    struct ggml_context * ctx = nullptr;
-
     ggml_backend_buffer_t buffer = nullptr;
+
+    std::vector<uint8_t> ctx_buf;
 };
 
 struct whisper_model {
@@ -939,9 +941,11 @@ static bool whisper_kv_cache_init(
     const int64_t n_mem      = n_text_layer*n_ctx;
     const int64_t n_elements = n_text_state*n_mem;
 
+    cache.ctx_buf.resize(2*ggml_tensor_overhead());
+
     struct ggml_init_params params = {
-        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
-        /*.mem_buffer =*/ nullptr,
+        /*.mem_size   =*/ cache.ctx_buf.size(),
+        /*.mem_buffer =*/ cache.ctx_buf.data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -951,17 +955,17 @@ static bool whisper_kv_cache_init(
     cache.cells.clear();
     cache.cells.resize(n_ctx);
 
-    cache.ctx = ggml_init(params);
+    struct ggml_context * ctx = ggml_init(params);
 
-    if (!cache.ctx) {
+    if (!ctx) {
         WHISPER_LOG_ERROR("%s: failed to allocate memory for the kv cache context\n", __func__);
         return false;
     }
 
-    cache.k = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
-    cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
+    cache.k = ggml_new_tensor_1d(ctx, wtype, n_elements);
+    cache.v = ggml_new_tensor_1d(ctx, wtype, n_elements);
 
-    cache.buffer = ggml_backend_alloc_ctx_tensors(cache.ctx, backend);
+    cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!cache.buffer) {
         WHISPER_LOG_ERROR("%s: failed to allocate memory for the kv cache\n", __func__);
         return false;
@@ -969,13 +973,13 @@ static bool whisper_kv_cache_init(
 
     ggml_backend_buffer_clear(cache.buffer, 0);
 
+    ggml_free(ctx);
+
     return true;
 }
 
 static void whisper_kv_cache_free(struct whisper_kv_cache & cache) {
-    ggml_free(cache.ctx);
     ggml_backend_buffer_free(cache.buffer);
-    cache.ctx = nullptr;
 }
 
 static bool whisper_kv_cache_find_slot(
@@ -2000,7 +2004,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
     auto & kv_pad = wstate.kv_pad;
 
-    WHISPER_ASSERT(!!kv_pad.ctx);
+    WHISPER_ASSERT(!!kv_pad.buffer);
 
     const int n_ctx_pad = GGML_PAD(n_ctx, 256);
 
@@ -2414,7 +2418,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     auto & kv_self = wstate.kv_self;
 
-    WHISPER_ASSERT(!!kv_self.ctx);
+    WHISPER_ASSERT(!!kv_self.buffer);
 
     const int n_ctx   = kv_self.size;
     const int n_state = hparams.n_text_state;
@@ -3160,7 +3164,7 @@ static bool log_mel_spectrogram(
         std::vector<std::thread> workers(n_threads - 1);
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw] = std::thread(
-                    log_mel_spectrogram_worker_thread, iw + 1, hann, samples_padded,
+                    log_mel_spectrogram_worker_thread, iw + 1, hann, std::cref(samples_padded),
                     n_samples + stage_2_pad, frame_size, frame_step, n_threads,
                     std::cref(filters), std::ref(mel));
         }
@@ -3662,6 +3666,9 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
     WHISPER_LOG_INFO("%s: flash attn = %d\n", __func__, params.flash_attn);
     WHISPER_LOG_INFO("%s: gpu_device = %d\n", __func__, params.gpu_device);
     WHISPER_LOG_INFO("%s: dtw        = %d\n", __func__, params.dtw_token_timestamps);
+
+    // TODO: temporary call to force backend registry initialization
+    WHISPER_LOG_INFO("%s: backends   = %zu\n", __func__, ggml_backend_reg_count());
 
     whisper_context * ctx = new whisper_context;
     ctx->params = params;
@@ -6196,7 +6203,7 @@ int whisper_full_with_state(
                                     n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                                 }
                             }
-                            if (params.new_segment_callback) {
+                            if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                                 params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                             }
                         }
@@ -6241,7 +6248,7 @@ int whisper_full_with_state(
                             n_new = whisper_wrap_segment(*ctx, *state, params.max_len, params.split_on_word);
                         }
                     }
-                    if (params.new_segment_callback) {
+                    if (params.new_segment_callback && !ctx->params.dtw_token_timestamps) {
                         params.new_segment_callback(ctx, state, n_new, params.new_segment_callback_user_data);
                     }
                 }
@@ -6250,11 +6257,16 @@ int whisper_full_with_state(
             // FIXME: will timestamp offsets be correct?
             // [EXPERIMENTAL] Token-level timestamps with DTW
             {
-                const auto n_segments = state->result_all.size() - n_segments_before;
+                const int n_segments = state->result_all.size() - n_segments_before;
                 if (ctx->params.dtw_token_timestamps && n_segments) {
                     const int n_frames = std::min(std::min(WHISPER_CHUNK_SIZE * 100, seek_delta), seek_end - seek);
                     whisper_exp_compute_token_level_timestamps_dtw(
                             ctx, state, params, result_all.size() - n_segments, n_segments, seek, n_frames, 7, params.n_threads);
+                    if (params.new_segment_callback) {
+                        for (int seg = (int) result_all.size() - n_segments; seg < n_segments; seg++) {
+                            params.new_segment_callback(ctx, state, seg, params.new_segment_callback_user_data);
+                        }
+                    }
                 }
             }
 
@@ -7017,7 +7029,7 @@ static void whisper_exp_compute_token_level_timestamps(
                         k++;
                     }
                     tokens[j].t1 = sample_to_timestamp(k);
-                    if (j < ns - 1 && tokens[j].t1 > tokens[j + 1].t0) {
+                    if (j < n - 1 && tokens[j].t1 > tokens[j + 1].t0) {
                         tokens[j].t1 = tokens[j + 1].t0;
                     } else {
                         s1 = k;
