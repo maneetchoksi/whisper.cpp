@@ -1,7 +1,10 @@
 require 'mkmf'
 
 # need to use c++ compiler flags
-$CXXFLAGS << ' -std=c++11'
+$CXXFLAGS << ' -std=c++17'
+
+$LDFLAGS << ' -lstdc++'
+
 # Set to true when building binary gems
 if enable_config('static-stdlib', false)
   $LDFLAGS << ' -static-libgcc -static-libstdc++'
@@ -10,34 +13,6 @@ end
 if enable_config('march-tune-native', false)
   $CFLAGS << ' -march=native -mtune=native'
   $CXXFLAGS << ' -march=native -mtune=native'
-end
-
-def with_disabling_unsupported_files
-  disabled_files = []
-
-  unless $GGML_METAL
-    disabled_files << 'ggml-metal.h' << 'ggml-metal.m'
-  end
-
-  unless $GGML_METAL_EMBED_LIBRARY
-    disabled_files << 'ggml-metal.metal'
-  end
-
-  unless $OBJ_ALL&.include? 'ggml-blas.o'
-    disabled_files << 'ggml-blas.h' << 'ggml-blas.cpp'
-  end
-
-  disabled_files.filter! {|file| File.exist? file}
-
-  disabled_files.each do |file|
-    File.rename file, "#{file}.disabled"
-  end
-
-  yield
-
-  disabled_files.each do |file|
-    File.rename "#{file}.disabled", file
-  end
 end
 
 if ENV['WHISPER_METAL']
@@ -60,16 +35,16 @@ if $GGML_METAL
   $GGML_METAL_EMBED_LIBRARY = true
 end
 
-$MK_CPPFLAGS = ''
+$MK_CPPFLAGS = '-Iggml/include -Iggml/src -Iggml/src/ggml-cpu -Iinclude -Isrc -Iexamples'
 $MK_CFLAGS   = '-std=c11   -fPIC'
-$MK_CXXFLAGS = '-std=c++11 -fPIC'
-$MK_NVCCFLAGS = '-std=c++11'
+$MK_CXXFLAGS = '-std=c++17 -fPIC'
+$MK_NVCCFLAGS = '-std=c++17'
 $MK_LDFLAGS = ''
 
-$OBJ_GGML = ''
-$OBJ_WHISPER = ''
-$OBJ_COMMON = ''
-$OBJ_SDL = ''
+$OBJ_GGML = []
+$OBJ_WHISPER = []
+$OBJ_COMMON = []
+$OBJ_SDL = []
 
 $MK_CPPFLAGS << ' -D_XOPEN_SOURCE=600'
 
@@ -136,11 +111,6 @@ unless ENV['RISCV']
     $MK_CFLAGS     << ' -march=native -mtune=native'
     $HOST_CXXFLAGS << ' -march=native -mtune=native'
   end
-
-  if $UNAME_M.match? /aarch64.*/
-    $MK_CFLAGS   << ' -mcpu=native'
-    $MK_CXXFLAGS << ' -mcpu=native'
-  end
 else
   $MK_CFLAGS   << ' -march=rv64gcv -mabi=lp64d'
   $MK_CXXFLAGS << ' -march=rv64gcv -mabi=lp64d'
@@ -148,11 +118,11 @@ end
 
 unless ENV['GGML_NO_ACCELERATE']
   if $UNAME_S == 'Darwin'
-    $MK_CPPFLAGS << ' -DGGML_USE_ACCELERATE -DGGML_USE_BLAS'
+    $MK_CPPFLAGS << ' -DGGML_USE_ACCELERATE -DGGML_USE_BLAS -DGGML_BLAS_USE_ACCELERATE'
     $MK_CPPFLAGS << ' -DACCELERATE_NEW_LAPACK'
     $MK_CPPFLAGS << ' -DACCELERATE_LAPACK_ILP64'
     $MK_LDFLAGS  << ' -framework Accelerate'
-    $OBJ_GGML    << ' ggml-blas.o'
+    $OBJ_GGML    << 'ggml/src/ggml-blas/ggml-blas.o'
   end
 end
 
@@ -160,20 +130,20 @@ if ENV['GGML_OPENBLAS']
   $MK_CPPFLAGS << " -DGGML_USE_BLAS #{`pkg-config --cflags-only-I openblas`.chomp}"
   $MK_CFLAGS   << " #{`pkg-config --cflags-only-other openblas)`.chomp}"
   $MK_LDFLAGS  << " #{`pkg-config --libs openblas`}"
-  $OBJ_GGML    << ' ggml-blas.o'
+  $OBJ_GGML    << 'ggml/src/ggml-blas/ggml-blas.o'
 end
 
 if ENV['GGML_OPENBLAS64']
   $MK_CPPFLAGS << " -DGGML_USE_BLAS #{`pkg-config --cflags-only-I openblas64`.chomp}"
   $MK_CFLAGS   << " #{`pkg-config --cflags-only-other openblas64)`.chomp}"
   $MK_LDFLAGS  << " #{`pkg-config --libs openblas64`}"
-  $OBJ_GGML    << ' ggml-blas.o'
+  $OBJ_GGML    << 'ggml/src/ggml-blas/ggml-blas.o'
 end
 
 if $GGML_METAL
   $MK_CPPFLAGS << ' -DGGML_USE_METAL'
   $MK_LDFLAGS  << ' -framework Foundation -framework Metal -framework MetalKit'
-  $OBJ_GGML    << ' ggml-metal.o'
+  $OBJ_GGML    << 'ggml/src/ggml-metal/ggml-metal.o'
 
   if ENV['GGML_METAL_NDEBUG']
     $MK_CPPFLAGS << ' -DGGML_METAL_NDEBUG'
@@ -181,21 +151,30 @@ if $GGML_METAL
 
   if $GGML_METAL_EMBED_LIBRARY
     $MK_CPPFLAGS << ' -DGGML_METAL_EMBED_LIBRARY'
-    $OBJ_GGML    << ' ggml-metal-embed.o'
+    $OBJ_GGML    << 'ggml/src/ggml-metal/ggml-metal-embed.o'
   end
 end
 
 $OBJ_GGML <<
-  ' ggml.o' <<
-  ' ggml-alloc.o' <<
-  ' ggml-backend.o' <<
-  ' ggml-quants.o' <<
-  ' ggml-aarch64.o'
+  'ggml/src/ggml.o' <<
+  'ggml/src/ggml-alloc.o' <<
+  'ggml/src/ggml-backend.o' <<
+  'ggml/src/ggml-backend-reg.o' <<
+  'ggml/src/ggml-opt.o' <<
+  'ggml/src/ggml-quants.o' <<
+  'ggml/src/ggml-threading.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu-cpp.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu-aarch64.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu-hbm.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu-quants.o' <<
+  'ggml/src/ggml-cpu/ggml-cpu-traits.o'
 
 $OBJ_WHISPER <<
-  ' whisper.o'
+  'src/whisper.o'
 
-$OBJ_ALL = "#{$OBJ_GGML} #{$OBJ_WHISPER} #{$OBJ_COMMON} #{$OBJ_SDL}"
+$objs = $OBJ_GGML + $OBJ_WHISPER + $OBJ_COMMON + $OBJ_SDL
+$objs << "ruby_whisper.o"
 
 $CPPFLAGS  = "#{$MK_CPPFLAGS} #{$CPPFLAGS}"
 $CFLAGS    = "#{$CPPFLAGS} #{$MK_CFLAGS} #{$GF_CFLAGS} #{$CFLAGS}"
@@ -204,26 +183,16 @@ $CXXFLAGS  = "#{$BASE_CXXFLAGS} #{$HOST_CXXFLAGS} #{$GF_CXXFLAGS} #{$CPPFLAGS}"
 $NVCCFLAGS = "#{$MK_NVCCFLAGS} #{$NVCCFLAGS}"
 $LDFLAGS   = "#{$MK_LDFLAGS} #{$LDFLAGS}"
 
-if $GGML_METAL_EMBED_LIBRARY
-  File.write 'depend', "$(OBJS): $(OBJS) ggml-metal-embed.o\n"
-end
-
-with_disabling_unsupported_files do
-
-  create_makefile('whisper')
-
-end
+create_makefile('whisper')
 
 File.open 'Makefile', 'a' do |file|
-  file.puts 'include get-flags.mk'
+  file.puts 'include scripts/get-flags.mk'
+  file.puts 'include cpu.mk'
 
   if $GGML_METAL
-    if $GGML_METAL_EMBED_LIBRARY
-      # mkmf determines object files to compile dependent on existing *.{c,cpp,m} files
-      # but ggml-metal-embed.c doesn't exist on creating Makefile.
-      file.puts "objs := $(OBJS)"
-      file.puts "OBJS = $(objs) 'ggml-metal-embed.o'"
+    file.puts 'include metal.mk'
 
+    if $GGML_METAL_EMBED_LIBRARY
       file.puts 'include metal-embed.mk'
     end
   end
