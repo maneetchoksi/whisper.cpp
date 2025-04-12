@@ -1,17 +1,18 @@
 #include "common.h"
+#include "common-whisper.h"
 
 #include "whisper.h"
 #include "httplib.h"
 #include "json.hpp"
 
+#include <chrono>
 #include <cmath>
-#include <fstream>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstring>
-#include <sstream>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -221,6 +222,24 @@ void check_ffmpeg_availibility() {
         std::cout << "and that its executable is included in your system's PATH. ";
         exit(0);
     }
+}
+
+std::string generate_temp_filename(const std::string &prefix, const std::string &extension) {
+    auto now = std::chrono::system_clock::now();
+    auto now_time_t = std::chrono::system_clock::to_time_t(now);
+
+    static std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<long long> dist(0, 1e9);
+
+    std::stringstream ss;
+    ss << prefix
+       << "-"
+       << std::put_time(std::localtime(&now_time_t), "%Y%m%d-%H%M%S")
+       << "-"
+       << dist(rng)
+       << extension;
+
+    return ss.str();
 }
 
 bool convert_to_wav(const std::string & temp_filename, std::string & error_resp) {
@@ -692,9 +711,7 @@ int main(int argc, char ** argv) {
         if (sparams.ffmpeg_converter) {
             // if file is not wav, convert to wav
             // write to temporary file
-            //const std::string temp_filename_base = std::tmpnam(nullptr);
-            const std::string temp_filename_base = "whisper-server-tmp"; // TODO: this is a hack, remove when the mutext is removed
-            const std::string temp_filename = temp_filename_base + ".wav";
+            const std::string temp_filename = generate_temp_filename("whisper-server", ".wav");
             std::ofstream temp_file{temp_filename, std::ios::binary};
             temp_file << audio_file.content;
             temp_file.close();
@@ -706,8 +723,8 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            // read wav content into pcmf32
-            if (!::read_wav(temp_filename, pcmf32, pcmf32s, params.diarize))
+            // read audio content into pcmf32
+            if (!::read_audio_data(temp_filename, pcmf32, pcmf32s, params.diarize))
             {
                 fprintf(stderr, "error: failed to read WAV file '%s'\n", temp_filename.c_str());
                 const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
@@ -718,10 +735,10 @@ int main(int argc, char ** argv) {
             // remove temp file
             std::remove(temp_filename.c_str());
         } else {
-            if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize))
+            if (!::read_audio_data(audio_file.content, pcmf32, pcmf32s, params.diarize))
             {
-                fprintf(stderr, "error: failed to read WAV file\n");
-                const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
+                fprintf(stderr, "error: failed to read audio data\n");
+                const std::string error_resp = "{\"error\":\"failed to read audio data\"}";
                 res.set_content(error_resp, "application/json");
                 return;
             }
@@ -1005,6 +1022,11 @@ int main(int argc, char ** argv) {
         res.set_content(success, "application/text");
 
         // check if the model is in the file system
+    });
+
+    svr.Get(sparams.request_path + "/health", [&](const Request &, Response &res){
+        const std::string health_response = "{\"status\":\"ok\"}";
+        res.set_content(health_response, "application/json");
     });
 
     svr.set_exception_handler([](const Request &, Response &res, std::exception_ptr ep) {
