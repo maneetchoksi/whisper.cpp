@@ -53,8 +53,10 @@ module Whisper
           http.request request do |response|
             case response
             when Net::HTTPNotModified
-            # noop
+              # noop
             when Net::HTTPOK
+              return if !response.key?("last-modified") && cache_path.exist?
+
               download response
             when Net::HTTPRedirection
               request URI(response["location"]), headers
@@ -68,7 +70,7 @@ module Whisper
       rescue => err
         if cache_path.exist?
           warn err
-        # Use cache file
+          # Use cache file
         else
           raise
         end
@@ -162,6 +164,12 @@ module Whisper
     ].each_with_object({}) {|name, models|
       models[name] = URI.new("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-#{name}.bin")
     }
+
+    %w[
+      silero-v5.1.2
+    ].each do |name|
+      @pre_converted_models[name] = URI.new("https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-#{name}.bin")
+    end
 
     class << self
       attr_reader :pre_converted_models
